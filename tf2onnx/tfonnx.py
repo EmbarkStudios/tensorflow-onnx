@@ -15,7 +15,7 @@ import traceback
 
 import numpy as np
 from onnx import helper, onnx_pb
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 from tensorflow.python.framework import graph_util
 from tensorflow.tools.graph_transforms import TransformGraph
 

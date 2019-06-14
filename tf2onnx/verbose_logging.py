@@ -11,7 +11,7 @@ from logging import *  # pylint: disable=wildcard-import, unused-wildcard-import
 import os
 import types
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 from . import constants
 

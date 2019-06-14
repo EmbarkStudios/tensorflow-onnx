@@ -10,7 +10,7 @@ from __future__ import unicode_literals
 
 import logging
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 from tensorflow.python.framework.graph_util import convert_variables_to_constants
 
 from tf2onnx import utils
@@ -91,7 +91,7 @@ def from_saved_model(model_path, input_names, output_names, signatures=None):
     inputs = {}
     outputs = {}
     try:
-        from tensorflow.contrib.saved_model.python.saved_model import signature_def_utils
+        from tensorflow.compat.v1.contrib.saved_model.python.saved_model import signature_def_utils
         # pylint: disable=unnecessary-lambda
         get_signature_def = lambda meta_graph_def, k: \
             signature_def_utils.get_signature_def_by_key(meta_graph_def, k)

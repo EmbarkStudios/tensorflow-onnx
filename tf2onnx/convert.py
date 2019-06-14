@@ -12,7 +12,7 @@ from __future__ import unicode_literals
 import argparse
 import sys
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 from tf2onnx.graph import GraphUtil
 from tf2onnx.tfonnx import process_tf_graph, tf_optimize
