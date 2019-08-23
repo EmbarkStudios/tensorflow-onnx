@@ -17,7 +17,7 @@ import numpy as np
 from onnx import helper, onnx_pb
 import tensorflow.compat.v1 as tf
 from tensorflow.python.framework import graph_util
-from tensorflow.tools.graph_transforms import TransformGraph
+from graph_transforms import TransformGraph
 
 import tf2onnx
 import tf2onnx.onnx_opset  # pylint: disable=unused-import
