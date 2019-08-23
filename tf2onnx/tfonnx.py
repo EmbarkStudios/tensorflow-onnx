@@ -17,12 +17,12 @@ import numpy as np
 from onnx import helper, onnx_pb
 import tensorflow.compat.v1 as tf
 from tensorflow.python.framework import graph_util
-from graph_transforms import TransformGraph
 
 import tf2onnx
 import tf2onnx.onnx_opset  # pylint: disable=unused-import
 import tf2onnx.custom_opsets  # pylint: disable=unused-import
 from tf2onnx.graph import Graph
+from tf2onnx.graph_transforms import TransformGraph
 from tf2onnx.graph_matcher import OpTypePattern, GraphMatcher
 from tf2onnx.rewriter import *  # pylint: disable=wildcard-import
 from tf2onnx.shape_inference import infer_shape
