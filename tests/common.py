@@ -13,7 +13,7 @@ from distutils.version import LooseVersion
 from parameterized import parameterized
 import numpy as np
 import tensorflow as tf
-from tf2onnx import constants, logging, utils
+from tf2onnx import constants, logging, utils, tf_utils
 
 __all__ = [
     "TestConfig",
@@ -45,7 +45,7 @@ __all__ = [
 class TestConfig(object):
     def __init__(self):
         self.platform = sys.platform
-        self.tf_version = utils.get_tf_version()
+        self.tf_version = tf_utils.get_tf_version()
         self.opset = int(os.environ.get("TF2ONNX_TEST_OPSET", constants.PREFERRED_OPSET))
         self.target = os.environ.get("TF2ONNX_TEST_TARGET", ",".join(constants.DEFAULT_TARGET)).split(',')
         self.backend = os.environ.get("TF2ONNX_TEST_BACKEND", "onnxruntime")
@@ -297,6 +297,12 @@ def validate_const_node(node, expected_val):
 def group_nodes_by_type(graph):
     res = defaultdict(list)
     for node in graph.get_nodes():
+        attr_body_graphs = node.get_body_graphs()
+        if attr_body_graphs:
+            for _, body_graph in attr_body_graphs.items():
+                body_graph_res = group_nodes_by_type(body_graph)
+                for k, v in body_graph_res.items():
+                    res[k].extend(v)
         res[node.type].append(node)
     return res
 
