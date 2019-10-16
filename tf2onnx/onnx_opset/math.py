@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # pylint: disable=unused-argument,missing-docstring
 
-@tf_op(["Add", "Div", "Mul", "Sub"])
+@tf_op(["Add", "AddV2", "Div", "Mul", "Sub"])
 class BroadcastOp(common.BroadcastOp):
     pass
 
@@ -135,6 +135,47 @@ class MinMaxOp:
         dtypes = node.output_dtypes
         ctx.remove_node(node.name)
         make_min_or_max_op(ctx, node.type, node.input, node.output, shapes, dtypes)
+
+
+@tf_op("ClipByValue")
+class ClipByValueOp:
+    # in tf-1.8 there was a ClipByValue op which in later versions was replaced by max(min(x, a), b)
+    # To support models generated with tf-1.8 rewrite the tf ClipByValue op to max(min(x, a), b)
+    @classmethod
+    def version_8(cls, ctx, node, **kwargs):
+        supported = [onnx_pb.TensorProto.FLOAT16, onnx_pb.TensorProto.FLOAT, onnx_pb.TensorProto.DOUBLE]
+        # fetch those upfront since they are not accessible once we remove 'node'
+        shapes = node.output_shapes
+        dtypes = node.output_dtypes
+        input_dtype = node.inputs[0].output_dtypes[0]
+        name = node.name
+        min_node = node.inputs[1]
+        if min_node.output_dtypes[0] not in supported:
+            # cast min if needed
+            min_node = ctx.insert_new_node_on_input(node, "Cast", min_node.output[0], to=onnx_pb.TensorProto.FLOAT)
+        max_node = node.inputs[2]
+        if max_node.output_dtypes[0] not in supported:
+            # cast max if needed
+            max_node = ctx.insert_new_node_on_input(node, "Cast", max_node.output[0], to=onnx_pb.TensorProto.FLOAT)
+        ctx.remove_node(name)
+        new_node = ctx.make_node("Max", [node.input[0], min_node.output[0]], outputs=[node.output[0]],
+                                 shapes=shapes, dtypes=dtypes)
+        if input_dtype not in supported:
+            # cast the data tensor if needed
+            ctx.insert_new_node_on_input(new_node, "Cast", new_node.input[0], to=onnx_pb.TensorProto.FLOAT)
+
+        new_node = ctx.insert_new_node_on_output("Min", new_node.output[0], name=utils.make_name(name))
+        new_node.input.append(max_node.output[0])
+        # copy shape and type
+        ctx.set_dtype(new_node.output[0], dtypes[0])
+        ctx.set_shape(new_node.output[0], shapes[0])
+        if dtypes[0] not in supported:
+            # cast output if needed
+            new_node = ctx.insert_new_node_on_output("Cast", new_node.output[0],
+                                                     name=utils.make_name(name), to=dtypes[0])
+            # copy shape and type
+            ctx.set_dtype(new_node.output[0], dtypes[0])
+            ctx.set_shape(new_node.output[0], shapes[0])
 
 
 @tf_op("Softmax")
@@ -251,15 +292,24 @@ class LRN:
         # ONNX: Each input value is divided by (bias+(alpha/size)*sum(xi^2 for every xi in the local region))^beta
         # TF: sqr_sum[a, b, c, d] = sum(input[a, b, c, d - depth_radius : d + depth_radius + 1] ** 2)
         #     output = input / (bias + alpha * sqr_sum) ** beta
-        depth_radius = node.get_attr("depth_radius")
-        if depth_radius:
-            size = depth_radius.i
-        else:
-            size = 5
+
+        # by default, depth_radius is 5 in tensorflow
+        size = node.get_attr_value("depth_radius", 5) * 2 + 1
+
         node.set_attr("size", size)
+        node.set_attr("alpha", size * node.get_attr("alpha").f)
+
+        shapes = node.output_shapes[0]
+        dtypes = node.output_dtypes[0]
+
+        ctx.insert_new_node_on_input(node, "Transpose", node.input[0], perm=constants.NHWC_TO_NCHW)
+        ctx.update_node_shape_dtype(node, override=True)
+        op_name = utils.make_name(node.name)
+        ctx.insert_new_node_on_output("Transpose", node.output[0], perm=constants.NCHW_TO_NHWC,
+                                      name=op_name, shapes=shapes, dtypes=dtypes)
 
 
-@tf_op(["MatMul", "BatchMatMul"])
+@tf_op(["MatMul", "BatchMatMul", "BatchMatMulV2"])
 class MatMul:
     @classmethod
     def version_1(cls, ctx, node, **kwargs):

@@ -16,7 +16,8 @@ import tensorflow as tf
 from backend_test_base import Tf2OnnxBackendTestBase
 # pylint reports unused-wildcard-import which is false positive, __all__ is defined in common
 from common import *  # pylint: disable=wildcard-import,unused-wildcard-import
-from tf2onnx import constants
+from tf2onnx import constants, utils
+from tf2onnx.graph_matcher import OpTypePattern, GraphMatcher
 
 # pylint: disable=missing-docstring,invalid-name,unused-argument
 
@@ -87,6 +88,7 @@ def get_conv_getdata(kind=1):
     else:
         raise ValueError("kind not known")
 
+
 def get_maxpoolwithargmax_getdata():
     data = [
         ('SAME', [1, 3, 3, 1], [1, 3, 3, 1], [1, 2, 2, 1]),
@@ -99,13 +101,14 @@ def get_maxpoolwithargmax_getdata():
     for idx, v in enumerate(data):
         yield (idx,) + v
 
+
 class BackendTests(Tf2OnnxBackendTestBase):
     def _run_test_case(self, output_names_with_port, feed_dict, **kwargs):
         kwargs["convert_var_to_const"] = False
         kwargs["constant_fold"] = False
         return self.run_test_case(feed_dict, [], output_names_with_port, **kwargs)
 
-    def _test_expand_dims(self, idx):
+    def _test_expand_dims_known_rank(self, idx):
         tf.reset_default_graph()
         x_val = make_xval([3, 4])
         x = tf.placeholder(tf.float32, shape=x_val.shape, name=_TFINPUT)
@@ -113,16 +116,9 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(op, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val})
 
-    def test_expand_dims(self):
+    def test_expand_dims_known_rank(self):
         for i in [-1, 0, 1, -2]:
-            self._test_expand_dims(i)
-
-    def test_expand_dims_dynamic_inputs(self):
-        x_val = make_xval([3, 4])
-        x = tf.placeholder(tf.float32, shape=[None, None], name=_TFINPUT)
-        op = tf.expand_dims(x, 0)
-        _ = tf.identity(op, name=_TFOUTPUT)
-        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+            self._test_expand_dims_known_rank(i)
 
     def test_expand_dims_one_unknown_rank(self):
         tf.reset_default_graph()
@@ -132,13 +128,17 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(op, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val})
 
-    def test_expand_dims_more_unknown_rank(self):
+    def _test_expand_dims_more_unknown_rank(self, idx):
         tf.reset_default_graph()
         x_val = make_xval([3, 4])
         x = tf.placeholder(tf.float32, shape=[None, None], name=_TFINPUT)
-        op = tf.expand_dims(x, 0)
+        op = tf.expand_dims(x, idx)
         _ = tf.identity(op, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
+    def test_expand_dims_more_unknown_rank(self):
+        for i in [-1, 0, 1, -2]:
+            self._test_expand_dims_more_unknown_rank(i)
 
     @check_opset_min_version(9, "ConstantOfShape")
     def test_eye_non_const1(self):
@@ -404,6 +404,24 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(conv, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val}, rtol=1e-05)
 
+    @check_onnxruntime_min_version("0.5.0", "conv transpose is added since onnxruntime-0.5.0")
+    def test_conv2d_transpose2(self):
+        # output_shape is dynamic
+        extra_opset = [utils.make_opsetid(constants.MICROSOFT_DOMAIN, 1)]
+        process_args = {"extra_opset": extra_opset}
+        x_shape = [2, 6, 4, 3]
+        output_shape = np.array([2, 13, 9, 2]).astype(np.int32)
+        kernel_shape = [3, 3, 2, 3]
+        strides = [1, 2, 2, 1]
+        x_val = make_xval(x_shape)
+        kernel_val = make_xval(kernel_shape)
+        x = tf.placeholder(tf.float32, shape=x_shape, name=_TFINPUT)
+        f = tf.constant(kernel_val, name="kernel", dtype=tf.float32)
+        output_shape_placeholder = tf.placeholder(tf.int32, shape=[4], name=_TFINPUT1)
+        conv = tf.nn.conv2d_transpose(x, f, output_shape_placeholder, strides=strides, padding="VALID")
+        _ = tf.identity(conv, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val, _INPUT1: output_shape}, rtol=1e-05, process_args=process_args)
+
     def test_depthwiseconv_0(self):
         x_shape = [1, 3, 4, 3]
         kernel_shape = [3, 3, 3, 3]
@@ -441,7 +459,9 @@ class BackendTests(Tf2OnnxBackendTestBase):
         feed_dict = {"input_1:0": x_val}
         input_names_with_port = ["input_1:0"]
         output_names_with_port = ["output:0"]
-        self.run_test_case(feed_dict, input_names_with_port, output_names_with_port)
+        self.run_test_case(feed_dict, input_names_with_port, output_names_with_port,
+                           graph_validator=lambda g: (check_op_count(g, "RandomUniform", 0) and
+                                                      check_op_count(g, "RandomUniformLike", 0)))
 
     def test_nn_dropout(self):
         keep_prob = tf.placeholder_with_default(1., (), "keep_prob")
@@ -458,7 +478,10 @@ class BackendTests(Tf2OnnxBackendTestBase):
         output_names_with_port = ["output:0"]
         # when constant_fold is enabled, PlaceholderWithDefault will be folded into either a const or a placeholder.
         # here we set it False to test PlaceholderWithDefault bug: https://github.com/onnx/tensorflow-onnx/pull/446
-        self.run_test_case(feed_dict, input_names_with_port, output_names_with_port, constant_fold=False)
+        # Dropout with ratio 1.0 will be optimized so that only one Identity is left
+        self.run_test_case(feed_dict, input_names_with_port, output_names_with_port, constant_fold=False,
+                           graph_validator=lambda g: (check_op_count(g, "RandomUniform", 0) and
+                                                      check_op_count(g, "RandomUniformLike", 0)))
 
     @check_tf_min_version("1.13")
     def test_nn_dropout_with_rate(self):
@@ -474,7 +497,9 @@ class BackendTests(Tf2OnnxBackendTestBase):
         feed_dict = {"input_1:0": x_val}
         input_names_with_port = ["input_1:0"]
         output_names_with_port = ["output:0"]
-        self.run_test_case(feed_dict, input_names_with_port, output_names_with_port, constant_fold=False)
+        self.run_test_case(feed_dict, input_names_with_port, output_names_with_port, constant_fold=False,
+                           graph_validator=lambda g: (check_op_count(g, "RandomUniform", 0) and
+                                                      check_op_count(g, "RandomUniformLike", 0)))
 
     def test_conv2d_with_input_transpose(self):
         x_shape = [2, 32, 32, 3]
@@ -489,13 +514,20 @@ class BackendTests(Tf2OnnxBackendTestBase):
                             process_args={"inputs_as_nchw": [_INPUT]},
                             onnx_feed_dict={_INPUT: x_val_for_onnx})
 
-    @unittest.skip("")
-    def test_lrn(self):
-        # FIXME: numerical results are not correct
+    def test_lrn_default(self):
         x_shape = [1, 3, 4, 3]
         x_val = np.arange(1, 1 + np.prod(x_shape)).astype("float32").reshape(x_shape)
-        _ = tf.placeholder(tf.float32, shape=x_val.shape, name=_TFINPUT)
-        op = tf.nn.local_response_normalization(x_val)
+        x_ = tf.placeholder(tf.float32, shape=x_shape, name=_TFINPUT)
+        op = tf.nn.local_response_normalization(x_)
+        _ = tf.identity(op, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val}, rtol=1e-05)
+
+    def test_lrn(self):
+        # can't set bias = 0
+        x_shape = [1, 2, 2, 8]
+        x_val = np.arange(1, 1 + np.prod(x_shape)).astype("float32").reshape(x_shape)
+        x_ = tf.placeholder(tf.float32, shape=x_shape, name=_TFINPUT)
+        op = tf.nn.local_response_normalization(x_, depth_radius=4, bias=2, alpha=2, beta=1)
         _ = tf.identity(op, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val}, rtol=1e-05)
 
@@ -794,6 +826,16 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(mi, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val1, _INPUT1: x_val2})
 
+    @check_opset_min_version(11, "Equal")
+    def test_equal_float(self):
+        x_val1 = np.array([0., 1., 2., 3., 4., -1., -2], dtype=np.float32)
+        x_val2 = np.array([0., 1., 2.1, 3.5, 4.6, -1.1, -2.9], dtype=np.float32)
+        x1 = tf.placeholder(tf.float32, x_val1.shape, name=_TFINPUT)
+        x2 = tf.placeholder(tf.float32, x_val2.shape, name=_TFINPUT1)
+        mi = tf.equal(x1, x2)
+        _ = tf.identity(mi, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val1, _INPUT1: x_val2})
+
     def test_equal(self):
         x_val1 = np.array([4, 2, 4, 1], dtype=np.int32).reshape((2, 2))
         x_val2 = np.array([2, 4, 4, 1], dtype=np.int32).reshape((2, 2))
@@ -914,6 +956,22 @@ class BackendTests(Tf2OnnxBackendTestBase):
                 _ = tf.identity(x_, name=_TFOUTPUT)
                 self._run_test_case([_OUTPUT], {_INPUT: x_val})
                 tf.reset_default_graph()
+
+    @skip_caffe2_backend("fails on caffe2 with dim issue")
+    @check_onnxruntime_incompatibility("Mul")
+    def test_leaky_relu_with_dependency(self):
+        x_val = 1000 * np.random.random_sample([1000, 100]).astype(np.float32)
+        x = tf.placeholder(x_val.dtype, [None] * x_val.ndim, name=_TFINPUT)
+        # simulate leaky_relu
+        alpha = tf.constant(0.5)
+        y = alpha * x
+        x_ = tf.maximum(y, x)
+        dependency = y - 1
+
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        _ = tf.identity(dependency, name=_TFOUTPUT1)
+        self._run_test_case([_OUTPUT, _OUTPUT1], {_INPUT: x_val})
+        tf.reset_default_graph()
 
     @skip_caffe2_backend("fails on caffe2 with dim issue")
     @check_onnxruntime_incompatibility("Mul")
@@ -1047,6 +1105,15 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(x_, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val})
 
+    def test_slice_neg_size(self):
+        x_val = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.float32)
+        t1 = tf.constant([0, 1], dtype=tf.int32)
+        t2 = tf.constant([-1, 2], dtype=tf.int32)
+        x0 = tf.placeholder(tf.float32, x_val.shape, name=_TFINPUT)
+        x_ = tf.slice(x0, t1, t2)
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
     @check_opset_min_version(10, "Slice in opset 10 can accept dymaic 'start' and 'ends'")
     def test_slice_with_non_const(self):
         x_val = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.float32)
@@ -1160,15 +1227,14 @@ class BackendTests(Tf2OnnxBackendTestBase):
                         or check_node_domain(group_nodes_by_type(g)["Range"][0], extra_opset.domain))
         tf.reset_default_graph()
 
-        # disable this case for ms domain due to onnxruntime range-1 issue
-        # https://github.com/Microsoft/onnxruntime/issues/730
-        if not (extra_opset and extra_opset.domain == constants.MICROSOFT_DOMAIN):
-            x = tf.range(3.0, 3.0, 5)
-            _ = tf.identity(x, name=_TFOUTPUT)
-            g = self._run_test_case([_OUTPUT], {}, process_args=process_args)
-            self.assertTrue(extra_opset is None
-                            or check_node_domain(group_nodes_by_type(g)["Range"][0], extra_opset.domain))
-            tf.reset_default_graph()
+        # disable this case due to onnxruntime loop issue
+        # https://github.com/microsoft/onnxruntime/issues/1272
+        # x = tf.range(3.0, 3.0, 5)
+        # _ = tf.identity(x, name=_TFOUTPUT)
+        # g = self._run_test_case([_OUTPUT], {}, process_args=process_args)
+        # self.assertTrue(extra_opset is None
+        #                 or check_node_domain(group_nodes_by_type(g)["Range"][0], extra_opset.domain))
+        # tf.reset_default_graph()
 
         delta_val = np.array(1.5, dtype=np.float32)
         delta = tf.placeholder(tf.float32, shape=(), name=_TFINPUT)
@@ -2008,6 +2074,61 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(x_, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val})
 
+    @check_opset_min_version(10, "ReverseSequence")
+    def test_reversev2_constant_axis(self):
+        # Tests for constant axis.
+        x_val_shape = [1, 2, 3, 4]
+        x_val = np.random.randint(0, 100, x_val_shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, x_val_shape, name=_TFINPUT)
+        x_ = tf.reverse_v2(x, axis=[3])
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+        tf.reset_default_graph()
+
+        # Empty axis vector.
+        x_val_shape = [2, 3, 4]
+        x_val = np.random.randint(0, 100, x_val_shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, x_val_shape, name=_TFINPUT)
+        x_ = tf.reverse_v2(x, axis=[])
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
+    @check_opset_min_version(10, "ReverseSequence")
+    def test_reversev2_vector_axis(self):
+        x_val_shape = [1, 2, 3, 4]
+        x_val = np.random.randint(0, 100, x_val_shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, x_val_shape, name=_TFINPUT)
+        x_ = tf.reverse_v2(x, axis=[0, -3, 2, 3])
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+        tf.reset_default_graph()
+
+        x_val_shape = [2, 3, 4]
+        x_val = np.random.randint(0, 100, x_val_shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, x_val_shape, name=_TFINPUT)
+        x_ = tf.reverse_v2(x, axis=[-3, 1, 2])
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+        tf.reset_default_graph()
+
+        x_val_shape = [5, 5, 9, 7, 8, 9]
+        x_val = np.random.randint(0, 100, x_val_shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, [5, 5, 9, 7, 8, 9], name=_TFINPUT)
+        x_ = tf.reverse_v2(x, axis=[0, 1, -2, 3, 5])
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
+    @check_opset_min_version(10, "ReverseSequence")
+    def test_reversev2_1D_tensor(self):
+        # For tensors with 1 dimension and no axis to reverse.
+        # Adds an identity block.
+        x_val_shape = [4]
+        x_val = np.random.randint(0, 100, x_val_shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, x_val_shape, name=_TFINPUT)
+        x_ = tf.reverse_v2(x, axis=[])
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
     @check_opset_min_version(8, "where")
     def test_where(self):
         x_val = np.array([1, 2, -3, 4, -5, -6, -7, 8, 9, 0], dtype=np.float32)
@@ -2173,7 +2294,6 @@ class BackendTests(Tf2OnnxBackendTestBase):
 
         self._run_test_case([_OUTPUT], {_INPUT: label_val, _INPUT1: logits_val}, rtol=1e-6)
 
-    @skip_onnxruntime_backend("onnxruntime Slice did not supported BOOL")
     def test_matrix_band_part(self):
         input_val = np.random.randint(0, 666, (10, 15)).astype(np.int32)
         input_x = tf.placeholder(dtype=tf.int32, shape=[None, None], name=_TFINPUT)
@@ -2183,7 +2303,6 @@ class BackendTests(Tf2OnnxBackendTestBase):
         _ = tf.identity(res1, name=_TFOUTPUT1)
         self._run_test_case([_OUTPUT, _OUTPUT1], {_INPUT: input_val})
 
-    @skip_onnxruntime_backend("onnxruntime Slice did not supported BOOL.")
     def test_matrix_band_part_2(self):
         input_val = np.random.randint(0, 666, (1, 1)).astype(np.int32)
         input_x = tf.placeholder(dtype=tf.int32, shape=[None, None], name=_TFINPUT)
@@ -2352,10 +2471,19 @@ class BackendTests(Tf2OnnxBackendTestBase):
 
     def test_batch_to_spacend(self):
         block_size = [2, 2]
-        crop = [[0, 1], [2, 1]]
+        crop = [[1, 0], [2, 1]]
 
         input_val = np.random.random_sample([40, 3, 5, 100]).astype(np.float32)
         input_x = tf.placeholder(dtype=tf.float32, shape=input_val.shape, name=_TFINPUT)  # NHWC
+        _ = tf.batch_to_space_nd(input_x, block_size, crop, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: input_val})
+
+    def test_batch_to_space3d(self):
+        block_size = [2, 2]
+        crop = [[0, 1], [2, 1]]
+
+        input_val = np.random.random_sample([40, 3, 100]).astype(np.float32)
+        input_x = tf.placeholder(dtype=tf.float32, shape=input_val.shape, name=_TFINPUT)  # NHC
         _ = tf.batch_to_space_nd(input_x, block_size, crop, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: input_val})
 
@@ -2477,6 +2605,138 @@ class BackendTests(Tf2OnnxBackendTestBase):
         y = tf.nn.selu(x)
         _ = tf.identity(y, name=_TFOUTPUT)
         self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
+    @check_opset_min_version(8, "ClipByValue (needs broadcast)")
+    def test_clip_by_value(self):
+        # float32, dynamic min/max
+        x_val = np.arange(0, 24, dtype=np.float32).reshape([3, 8])
+        x_minval = np.array(8.5, dtype=np.float32)
+        x_maxval = np.array(16.5, dtype=np.float32)
+        x = tf.placeholder(x_val.dtype, x_val.shape, name=_TFINPUT)
+        x_min = tf.placeholder(tf.float32, name=_TFINPUT1)
+        x_max = tf.placeholder(tf.float32, name=_TFINPUT2)
+        y = tf.clip_by_value(x, x_min, x_max)
+        _ = tf.identity(y, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val, _INPUT1: x_minval, _INPUT2: x_maxval})
+        # float32, const min/max
+        tf.reset_default_graph()
+        x_val = np.arange(0, 24, dtype=np.float32).reshape([3, 8])
+        x = tf.placeholder(x_val.dtype, x_val.shape, name=_TFINPUT)
+        y = tf.clip_by_value(x, 8.5, 16.5)
+        _ = tf.identity(y, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+        # int32, converter needs to cast, const min/max
+        tf.reset_default_graph()
+        x_val = np.arange(0, 24, dtype=np.int32).reshape([3, 8])
+        x = tf.placeholder(x_val.dtype, x_val.shape, name=_TFINPUT)
+        y = tf.clip_by_value(x, 8, 16)
+        _ = tf.identity(y, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val})
+
+    # test for gemm pattern0: alpha*A*B + beta*C
+    def test_gemm_pattern0(self):
+        max_number = 10
+        m = np.random.randint(max_number)
+        n = np.random.randint(max_number)
+        k = np.random.randint(max_number)
+        x_val1 = np.random.rand(m, n).astype("float32")
+        x_val2 = np.random.rand(n, k).astype("float32")
+        x_val3 = np.random.rand(m, k).astype("float32")
+        a = tf.placeholder(tf.float32, x_val1.shape, name=_TFINPUT)
+        b = tf.placeholder(tf.float32, x_val2.shape, name=_TFINPUT1)
+        c = tf.placeholder(tf.float32, x_val3.shape, name=_TFINPUT2)
+        alpha = tf.constant(1.0, dtype=tf.float32)
+        beta = tf.constant(2.0, dtype=tf.float32)
+        mul1 = tf.multiply(alpha, tf.matmul(a, b))
+        mul2 = tf.multiply(beta, c)
+        x_ = mul1 + mul2
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val1, _INPUT1: x_val2, _INPUT2: x_val3},
+                            graph_validator=lambda g: check_op_count(g, "Gemm", 1))
+
+    # test for gemm pattern1: alpha*A*B + C
+    def test_gemm_pattern1(self):
+        max_number = 10
+        m = np.random.randint(max_number)
+        n = np.random.randint(max_number)
+        k = np.random.randint(max_number)
+        x_val1 = np.random.rand(m, n).astype("float32")
+        x_val2 = np.random.rand(n, k).astype("float32")
+        x_val3 = np.random.rand(m, k).astype("float32")
+        a = tf.placeholder(tf.float32, x_val1.shape, name=_TFINPUT)
+        b = tf.placeholder(tf.float32, x_val2.shape, name=_TFINPUT1)
+        c = tf.placeholder(tf.float32, x_val3.shape, name=_TFINPUT2)
+        alpha = tf.constant(1.0, dtype=tf.float32)
+        x_ = tf.multiply(alpha, tf.matmul(a, b)) + c
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val1, _INPUT1: x_val2, _INPUT2: x_val3},
+                            graph_validator=lambda g: check_op_count(g, "Gemm", 1))
+
+    # test for gemm pattern2: A*B + beta*C
+    def test_gemm_pattern2(self):
+        max_number = 10
+        m = np.random.randint(max_number)
+        n = np.random.randint(max_number)
+        k = np.random.randint(max_number)
+        x_val1 = np.random.rand(m, n).astype("float32")
+        x_val2 = np.random.rand(n, k).astype("float32")
+        x_val3 = np.random.rand(m, k).astype("float32")
+        a = tf.placeholder(tf.float32, x_val1.shape, name=_TFINPUT)
+        b = tf.placeholder(tf.float32, x_val2.shape, name=_TFINPUT1)
+        c = tf.placeholder(tf.float32, x_val3.shape, name=_TFINPUT2)
+        beta = tf.constant(2.0, dtype=tf.float32)
+        x_ = tf.matmul(a, b) + tf.multiply(beta, c)
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val1, _INPUT1: x_val2, _INPUT2: x_val3},
+                            graph_validator=lambda g: check_op_count(g, "Gemm", 1))
+
+    # test for gemm pattern3: A*B + C
+    def test_gemm_pattern3(self):
+        max_number = 10
+        m = np.random.randint(max_number)
+        n = np.random.randint(max_number)
+        k = np.random.randint(max_number)
+        x_val1 = np.random.rand(m, n).astype("float32")
+        x_val2 = np.random.rand(n, k).astype("float32")
+        x_val3 = np.random.rand(m, k).astype("float32")
+        a = tf.placeholder(tf.float32, x_val1.shape, name=_TFINPUT)
+        b = tf.placeholder(tf.float32, x_val2.shape, name=_TFINPUT1)
+        c = tf.placeholder(tf.float32, x_val3.shape, name=_TFINPUT2)
+        x_ = tf.matmul(a, b) + c
+        _ = tf.identity(x_, name=_TFOUTPUT)
+        self._run_test_case([_OUTPUT], {_INPUT: x_val1, _INPUT1: x_val2, _INPUT2: x_val3},
+                            graph_validator=lambda g: check_op_count(g, "Gemm", 1))
+
+    def test_graph_matcher(self):
+        shape = [2, 6]
+        x_val = np.random.random(shape).astype(np.float32)
+        y_val = np.random.random(shape).astype(np.float32)
+        z_val = np.random.random(shape).astype(np.float32)
+        x = tf.placeholder(tf.float32, shape, name=_TFINPUT)
+        y = tf.placeholder(tf.float32, shape, name=_TFINPUT1)
+        z = tf.placeholder(tf.float32, shape, name=_TFINPUT2)
+        tmp1 = x + y
+        tmp2 = x - y
+        tmp3 = tf.multiply(tmp1, z)
+        tmp4 = tf.multiply(tmp2, z)
+        _ = tf.add(tmp4, tmp3, name=_TFOUTPUT)
+        onnx_graph = self._run_test_case([_OUTPUT], {_INPUT: x_val, _INPUT1: y_val, _INPUT2: z_val})
+        pattern = \
+            OpTypePattern('Add', name='output', inputs=[
+                OpTypePattern('Mul', inputs=[
+                    OpTypePattern('Add', name='input1'),
+                    OpTypePattern('*', name='input2')]),
+                OpTypePattern('Mul', inputs=[
+                    OpTypePattern('Sub', name='input1'),
+                    OpTypePattern('*', name='input2')])])
+
+        matcher = GraphMatcher(pattern, allow_reorder=False)
+        match_results = list(matcher.match_ops(onnx_graph.get_nodes()))
+        self.assertTrue(len(match_results) == 0)
+        matcher = GraphMatcher(pattern, allow_reorder=True)
+        match_results = list(matcher.match_ops(onnx_graph.get_nodes()))
+        self.assertTrue(len(match_results) == 1)
+
 
 if __name__ == '__main__':
     unittest_main()
